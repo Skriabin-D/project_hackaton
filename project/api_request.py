@@ -1,5 +1,7 @@
 import requests as rq
 from config import API
+import json
+from urllib.parse import urlencode
 
 def town_code(town):
     url = 'https://suggests.rasp.yandex.net/all_suggests'
@@ -22,8 +24,13 @@ def path(depart_town, arrive_town, date):
         'from': depart_town_code,
         'to': arrive_town_code,
         'lang': 'ru_RU',
-        'date': date
+        'date': date,
+        'transfers': "true"
     }
     response = rq.get(url, params=params)
     data = response.json()
-    return data
+    # return data
+    formatted_data = json.dumps(data, indent=4, ensure_ascii=False)
+    # return formatted_data
+    final_url = f"{url}?{urlencode(params)}"
+    return final_url
