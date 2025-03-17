@@ -1,11 +1,21 @@
+'''
+Файл, в котором происходит построение графа  по данным полученным от API
+'''
 import requests
 import networkx as nx
 from datetime import datetime
 
+
 from api_request import path
 
-# Универсальная функция для извлечения данных с учетом возможных вариантов полей
+
 def get_station_info(segment, keys):
+    '''
+    Универсальная функция для извлечения данных с учетом возможных вариантов полей
+    :param segment: dict
+    :param keys: any
+    :return: code, title or None
+    '''
     for key in keys:
         value = segment.get(key)
         if value:
@@ -15,10 +25,31 @@ def get_station_info(segment, keys):
                 return code, title
     return None, None
 
-def graph(depart_town, arrive_town, date):
-    G = nx.Graph()
-    url = path(depart_town, arrive_town, date)
+def calculate_duration(departure, arrival, fmt="%Y-%m-%dT%H:%M:%S%z"):
+    '''
+    Вычисляет продолжительность в минутах между departure и arrival.
+    :param departure: Any
+    :param arrival: Any
+    :param fmt: str
+    :return: int or None
+    '''
+    if departure and arrival:
+        dep_time = datetime.strptime(departure, fmt)
+        arr_time = datetime.strptime(arrival, fmt)
+        return (arr_time - dep_time).seconds // 60
+    return None
 
+def graph(depart_town, arrive_town, date):
+    '''
+    Функция построения графа
+    :param depart_town: string
+    :param arrive_town: string
+    :param date: string
+    :return: nx.DiGraph
+    '''
+    G = nx.DiGraph()  # Используем направленный граф для учета последовательности
+
+    url = path(depart_town, arrive_town, date)
     response = requests.get(url)
     if response.status_code != 200:
         return None
@@ -28,195 +59,151 @@ def graph(depart_town, arrive_town, date):
         return None
 
     from_city = data['search']['from']['title']
+    to_city = data['search']['to']['title']
     fmt = "%Y-%m-%dT%H:%M:%S%z"
 
-    for segment in data['segments']:
+    for segment_idx, segment in enumerate(data['segments']):
         # Извлекаем данные о станции отправления и прибытия
-        from_station_code, from_station = get_station_info(segment, ['from', 'departure_from', 'station_from', 'location_from'])
-        to_station_code, to_station = get_station_info(segment, ['to', 'arrival_to', 'station_to', 'location_to'])
+        from_station_code, from_station = get_station_info(segment, ['departure_from', 'from', 'station_from'])
+        to_station_code, to_station = get_station_info(segment, ['arrival_to', 'to', 'station_to'])
 
         departure_data = segment.get('departure')
         arrival_data = segment.get('arrival')
-        transport_type = segment.get('thread', {}).get('transport_type')
+        transport_type = segment.get('thread', {}).get('transport_type', 'Не указан')
         cost = segment.get('tickets', [{}])[0].get('price', {}).get('whole', 'Не указана')
 
-        if from_station_code and from_station and to_station_code and to_station:
-            # Добавляем станции в граф
-            G.add_node(from_station_code, name_station=from_station, name_city=from_city)
-            G.add_node(to_station_code, name_station=to_station, name_city=arrive_town)
+        if not (from_station_code and to_station_code):
+            continue  # Пропускаем некорректные сегменты
 
-            # Вычисляем длительность пути
-            if departure_data and arrival_data:
-                departure_time = datetime.strptime(departure_data, fmt)
-                arrival_time = datetime.strptime(arrival_data, fmt)
-                duration = (arrival_time - departure_time).seconds // 60
-            else:
-                duration = None
+        # Добавляем узлы с атрибутами
+        G.add_node(from_station_code, name_station=from_station, name_city=from_city)
+        G.add_node(to_station_code, name_station=to_station, name_city=to_city)
 
-            # Добавляем обычное ребро в граф
+        # Прямой маршрут (без пересадок)
+        if not segment.get('has_transfers', False):
+            duration = calculate_duration(departure_data, arrival_data)
+            if duration is None:
+                continue  # Пропускаем, если нет времени
+
             G.add_edge(from_station_code, to_station_code,
-                       date=departure_data or 'Не указана',
-                       duration=duration or 'Не указана',
+                       duration=duration,
+                       date=departure_data,
                        cost=cost,
-                       transport_type=transport_type or 'Не указан')
-
+                       transport_type=transport_type,
+                       segment_id=segment_idx)
+        else:
             # Обработка пересадок
-            if segment.get('has_transfers', False):
-                for transfer in segment.get('details', []):
-                    transfer_from_code, transfer_from_station = get_station_info(transfer, ['from', 'departure_from', 'station_from', 'location_from'])
-                    transfer_to_code, transfer_to_station = get_station_info(transfer, ['to', 'arrival_to', 'station_to', 'location_to'])
+            last_code = from_station_code
+            last_arrival_time = departure_data
+            details = segment.get('details', [])
 
-                    transfer_departure = transfer.get('departure')
-                    transfer_arrival = transfer.get('arrival')
+            for detail in details:
+                if 'is_transfer' in detail:
+                    # Это пересадка
+                    transfer_from_code, transfer_from_station = get_station_info(detail, ['transfer_from'])
+                    transfer_to_code, transfer_to_station = get_station_info(detail, ['transfer_to'])
+                    transfer_duration = detail.get('duration')
 
-                    if transfer_from_code and transfer_to_code and transfer_departure and transfer_arrival:
-                        transfer_departure_time = datetime.strptime(transfer_departure, fmt)
-                        transfer_arrival_time = datetime.strptime(transfer_arrival, fmt)
-                        transfer_duration = (transfer_arrival_time - transfer_departure_time).seconds // 60
+                    if not (transfer_from_code and transfer_to_code):
+                        continue
 
-                        # Добавляем станции пересадки в граф
-                        if transfer_from_code not in G:
-                            G.add_node(transfer_from_code, name_station=transfer_from_station or f"Пересадка ({transfer_from_code})")
-                        if transfer_to_code not in G:
-                            G.add_node(transfer_to_code, name_station=transfer_to_station or f"Пересадка ({transfer_to_code})")
+                    # Добавляем узлы пересадки
+                    transfer_city = detail.get('transfer_point', {}).get('title', 'Не указан')
+                    G.add_node(transfer_from_code, name_station=transfer_from_station, name_city=transfer_city)
+                    G.add_node(transfer_to_code, name_station=transfer_to_station, name_city=transfer_city)
 
-                        # Добавляем ребро пересадки в граф
-                        G.add_edge(transfer_from_code, transfer_to_code, duration=transfer_duration)
+                    # Вычисляем duration для пересадки
+                    if transfer_duration:
+                        duration_minutes = transfer_duration // 60
+                    else:
+                        duration_minutes = 0  # Минимальная длительность пересадки
 
-    return G
+                    # Связываем предыдущий узел с началом пересадки
+                    if last_arrival_time and detail.get('departure'):
+                        duration_to_transfer = calculate_duration(last_arrival_time, detail.get('departure'))
+                    else:
+                        duration_to_transfer = duration_minutes
 
-# ДАЛЕЕ ЧЕРНОВИК ГДЕ ВСЕ ВЫВОДИТСЯ!! НЕ УДОЛЯЙТЕ!
+                    if duration_to_transfer is not None:
+                        G.add_edge(last_code, transfer_from_code,
+                                   duration=duration_to_transfer,
+                                   transport_type="Пересадка",
+                                   segment_id=segment_idx)
 
-# import requests
-# import networkx as nx
-# import matplotlib.pyplot as plt
-# from datetime import datetime
+                    # Добавляем ребро самой пересадки
+                    G.add_edge(transfer_from_code, transfer_to_code,
+                               duration=duration_minutes,
+                               transport_type="Пересадка",
+                               segment_id=segment_idx)
 
-# from api_request import path
+                    last_code = transfer_to_code
+                    last_arrival_time = detail.get('arrival')
+                else:
+                    # Это участок маршрута
+                    detail_from_code, detail_from_station = get_station_info(detail, ['from'])
+                    detail_to_code, detail_to_station = get_station_info(detail, ['to'])
+                    detail_departure = detail.get('departure')
+                    detail_arrival = detail.get('arrival')
+                    detail_duration = detail.get('duration')
+                    detail_transport = detail.get('thread', {}).get('transport_type', 'Не указан')
 
-# # Универсальная функция для извлечения данных с учетом возможных вариантов полей
-# def get_station_info(segment, keys):
-#     for key in keys:
-#         value = segment.get(key)
-#         if value:
-#             code = value.get('code')
-#             title = value.get('title')
-#             if code and title:
-#                 return code, title
-#     return None, None
+                    if not (detail_from_code and detail_to_code):
+                        continue
 
-# def main():
-#     G = nx.Graph()
+                    detail_from_city = detail.get('from', {}).get('title', 'Не указан')
+                    detail_to_city = detail.get('to', {}).get('title', 'Не указан')
 
-#     depart_town = input('Введите город отправления: ')
-#     arrive_town = input('Введите город прибытия: ')
-#     date = input('Введите дату отправления (в формате ГГГГ-ММ-ДД): ')
+                    # Используем коды станций из departure_from и arrival_to, если они есть
+                    actual_from_code = get_station_info(detail, ['departure_from'])[0] or detail_from_code
+                    actual_to_code = get_station_info(detail, ['arrival_to'])[0] or detail_to_code
 
-#     url = path(depart_town, arrive_town, date)
-#     print(url)
+                    G.add_node(actual_from_code, name_station=detail_from_station, name_city=detail_from_city)
+                    G.add_node(actual_to_code, name_station=detail_to_station, name_city=detail_to_city)
 
-#     response = requests.get(url)
-#     if response.status_code != 200:
-#         print(f"Ошибка: {response.status_code}, {response.text}")
-#         return
+                    # Вычисляем duration
+                    duration = calculate_duration(detail_departure, detail_arrival)
+                    if duration is None and detail_duration:
+                        duration = detail_duration // 60
 
-#     data = response.json()
-#     if 'segments' not in data:
-#         print("Нет доступных маршрутов на выбранную дату.")
-#         return
+                    if duration is not None:
+                        G.add_edge(actual_from_code, actual_to_code,
+                                   duration=duration,
+                                   date=detail_departure,
+                                   transport_type=detail_transport,
+                                   segment_id=segment_idx)
 
-#     from_city = data['search']['from']['title']
-#     fmt = "%Y-%m-%dT%H:%M:%S%z"
-#     processed_routes = 0
+                    # Связываем с предыдущим узлом
+                    if last_code != actual_from_code:
+                        if last_arrival_time and detail_departure:
+                            duration_between = calculate_duration(last_arrival_time, detail_departure)
+                        else:
+                            duration_between = 0
 
-#     for segment in data['segments']:
-#         # Извлекаем данные о станции отправления
-#         from_station_code, from_station = get_station_info(segment, ['from', 'departure_from', 'station_from', 'location_from'])
-#         to_station_code, to_station = get_station_info(segment, ['to', 'arrival_to', 'station_to', 'location_to'])
+                        if duration_between is not None:
+                            G.add_edge(last_code, actual_from_code,
+                                       duration=duration_between,
+                                       transport_type="Пересадка",
+                                       segment_id=segment_idx)
 
-#         departure_data = segment.get('departure')
-#         arrival_data = segment.get('arrival')
-#         transport_type = segment.get('thread', {}).get('transport_type')
-#         cost = segment.get('tickets', [{}])[0].get('price', {}).get('whole', 'Не указана')
+                    last_code = actual_to_code
+                    last_arrival_time = detail_arrival
 
-#         if from_station_code and from_station and to_station_code and to_station:
-#             processed_routes += 1
+            # Связываем последнюю пересадку с конечной точкой
+            if last_code != to_station_code:
+                duration_to_end = calculate_duration(last_arrival_time, arrival_data)
+                if duration_to_end is not None:
+                    G.add_edge(last_code, to_station_code,
+                               duration=duration_to_end,
+                               transport_type="После пересадки",
+                               segment_id=segment_idx)
 
-#             # === ОТЛАДОЧНЫЙ ВЫВОД ===
-#             print(f"Добавляю маршрут #{processed_routes}: {from_station} ({from_station_code}) → {to_station} ({to_station_code})")
+    # Удаляем петли и проверяем связность
+    G.remove_edges_from(nx.selfloop_edges(G))
 
-#             # Добавляем станции в граф
-#             G.add_node(from_station_code, name_station=from_station, name_city=from_city)
-#             G.add_node(to_station_code, name_station=to_station, name_city=arrive_town)
+    # Проверяем, что все ребра имеют duration
+    for u, v, d in G.edges(data=True):
+        if 'duration' not in d or d['duration'] is None:
+            G.remove_edge(u, v)
 
-#             # Вычисляем длительность пути
-#             if departure_data and arrival_data:
-#                 departure_time = datetime.strptime(departure_data, fmt)
-#                 arrival_time = datetime.strptime(arrival_data, fmt)
-#                 duration = (arrival_time - departure_time).seconds // 60
-#             else:
-#                 duration = None
+    return G if nx.is_weakly_connected(G) else None
 
-#             # Добавляем обычное ребро в граф
-#             G.add_edge(from_station_code, to_station_code,
-#                        date=departure_data or 'Не указана',
-#                        duration=duration or 'Не указана',
-#                        cost=cost,
-#                        transport_type=transport_type or 'Не указан')
-
-#             # === ОБРАБОТКА ПЕРЕСАДОК ===
-#             if segment.get('has_transfers', False):
-#                 print(f"Найдены пересадки для маршрута {from_station_code} → {to_station_code}")
-
-#                 for transfer in segment.get('details', []):
-#                     transfer_from_code, transfer_from_station = get_station_info(transfer, ['from', 'departure_from', 'station_from', 'location_from'])
-#                     transfer_to_code, transfer_to_station = get_station_info(transfer, ['to', 'arrival_to', 'station_to', 'location_to'])
-
-#                     transfer_departure = transfer.get('departure')
-#                     transfer_arrival = transfer.get('arrival')
-
-#                     if transfer_from_code and transfer_to_code and transfer_departure and transfer_arrival:
-#                         transfer_departure_time = datetime.strptime(transfer_departure, fmt)
-#                         transfer_arrival_time = datetime.strptime(transfer_arrival, fmt)
-#                         transfer_duration = (transfer_arrival_time - transfer_departure_time).seconds // 60
-
-#                         # === ОТЛАДОЧНЫЙ ВЫВОД ===
-#                         print(f"Добавляю пересадку: {transfer_from_code} → {transfer_to_code}, длительность: {transfer_duration} мин")
-
-#                         # Добавляем станции пересадки в граф
-#                         if transfer_from_code not in G:
-#                             G.add_node(transfer_from_code, name_station=transfer_from_station or f"Пересадка ({transfer_from_code})")
-#                         if transfer_to_code not in G:
-#                             G.add_node(transfer_to_code, name_station=transfer_to_station or f"Пересадка ({transfer_to_code})")
-
-#                         # Добавляем ребро пересадки в граф
-#                         G.add_edge(transfer_from_code, transfer_to_code, duration=transfer_duration)
-
-#     # === ВЫВОД ГРАФА В ТЕРМИНАЛ ===
-#     print("\n=== ВЫВОД ГРАФА В ТЕРМИНАЛ ===")
-#     print("Узлы графа:")
-#     for node, data in G.nodes(data=True):
-#         print(f"{node}: {data}")
-
-#     print("\nРёбра графа:")
-#     for u, v, data in G.edges(data=True):
-#         print(f"{u} -> {v}: {data}")
-
-#     # === ПОСТРОЕНИЕ ГРАФА ===
-#     pos = nx.spring_layout(G)
-#     labels = {node: f"{data['name_station']}\n({node})" for node, data in G.nodes(data=True)}
-#     edge_labels = {
-#         (u, v): f"{d.get('duration', '—')} мин\n{d.get('cost', '—')} ₽\n{d.get('transport_type', '')}" 
-#         for u, v, d in G.edges(data=True)
-#     }
-
-#     nx.draw(G, pos, with_labels=True, labels=labels, node_color='lightblue', node_size=1000, font_size=10)
-#     nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
-
-#     plt.title(f"Маршрут из {depart_town} в {arrive_town}")
-#     plt.show()
-
-#     print(f"\n✅ Добавлено маршрутов: {processed_routes}")
-
-# if __name__ == '__main__':
-#     main()

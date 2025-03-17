@@ -4,6 +4,11 @@ import json
 from urllib.parse import urlencode
 
 def town_code(town):
+    '''
+    Функция, возвращающая код города по его названию
+    :param town: str
+    :return: str
+    '''
     url = 'https://suggests.rasp.yandex.net/all_suggests'
 
     params = {
@@ -15,6 +20,13 @@ def town_code(town):
     return data['suggests'][0]['point_key']
 
 def path(depart_town, arrive_town, date):
+    '''
+    Функция составляющая url для API запроса
+    :param depart_town: str
+    :param arrive_town: str
+    :param date: str
+    :return: str
+    '''
     depart_town_code = town_code(depart_town)
     arrive_town_code = town_code(arrive_town)
 
@@ -27,10 +39,5 @@ def path(depart_town, arrive_town, date):
         'date': date,
         'transfers': "true"
     }
-    response = rq.get(url, params=params)
-    data = response.json()
-    # return data
-    formatted_data = json.dumps(data, indent=4, ensure_ascii=False)
-    # return formatted_data
     final_url = f"{url}?{urlencode(params)}"
     return final_url
